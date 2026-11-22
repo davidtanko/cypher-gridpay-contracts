@@ -124,7 +124,12 @@ fn budget_bench_payment() {
             &meta,
         );
     });
-    report_and_assert("create_payment", m, MAX_CREATE_PAYMENT_CPU, MAX_CREATE_PAYMENT_MEM);
+    report_and_assert(
+        "create_payment",
+        m,
+        MAX_CREATE_PAYMENT_CPU,
+        MAX_CREATE_PAYMENT_MEM,
+    );
 
     let m = measure(&f.env, || f.payment.complete_payment(&f.admin, &id));
     report_and_assert(
@@ -136,7 +141,12 @@ fn budget_bench_payment() {
 
     let reason = String::from_str(&f.env, "bench");
     let m = measure(&f.env, || f.payment.pause_contract(&f.admin, &reason));
-    report_and_assert("payment.pause_contract", m, MAX_PAUSE_PAYMENT_CPU, MAX_PAUSE_PAYMENT_MEM);
+    report_and_assert(
+        "payment.pause_contract",
+        m,
+        MAX_PAUSE_PAYMENT_CPU,
+        MAX_PAUSE_PAYMENT_MEM,
+    );
 }
 
 #[test]
@@ -157,12 +167,27 @@ fn budget_bench_escrow() {
             &false,
         );
     });
-    report_and_assert("create_escrow", m, MAX_CREATE_ESCROW_CPU, MAX_CREATE_ESCROW_MEM);
+    report_and_assert(
+        "create_escrow",
+        m,
+        MAX_CREATE_ESCROW_CPU,
+        MAX_CREATE_ESCROW_MEM,
+    );
 
     let m = measure(&f.env, || f.escrow.release_escrow(&f.admin, &id, &false));
-    report_and_assert("release_escrow", m, MAX_RELEASE_ESCROW_CPU, MAX_RELEASE_ESCROW_MEM);
+    report_and_assert(
+        "release_escrow",
+        m,
+        MAX_RELEASE_ESCROW_CPU,
+        MAX_RELEASE_ESCROW_MEM,
+    );
 
     let reason = String::from_str(&f.env, "bench");
     let m = measure(&f.env, || f.escrow.pause_contract(&f.admin, &reason));
-    report_and_assert("escrow.pause_contract", m, MAX_PAUSE_ESCROW_CPU, MAX_PAUSE_ESCROW_MEM);
+    report_and_assert(
+        "escrow.pause_contract",
+        m,
+        MAX_PAUSE_ESCROW_CPU,
+        MAX_PAUSE_ESCROW_MEM,
+    );
 }
