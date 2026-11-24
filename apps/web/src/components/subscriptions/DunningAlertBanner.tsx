@@ -212,6 +212,13 @@ export const DunningAlertBanner: React.FC<DunningAlertBannerProps> = ({
     retryEligible &&
     !isBusy &&
     phase !== 'success';
+  const bannerState = state?.inDunning
+    ? `dunning-retry-${state.retryCount}`
+    : state
+      ? 'dunning-recovered'
+      : phase === 'error'
+        ? 'dunning-error'
+        : 'dunning-loading';
 
   const handleOpenConfirm = useCallback(async () => {
     setError(null);
@@ -307,9 +314,9 @@ export const DunningAlertBanner: React.FC<DunningAlertBannerProps> = ({
     if (phase === 'error' && error) {
       return (
         <div
-          className={className}
+          className={`gp-dunning-alert ${className ?? ''}`}
           role="alert"
-          data-testid="dunning-alert-banner"
+          data-testid="dunning-alert-banner" data-state={bannerState}
         >
           <div className="rounded-lg border border-red-300 bg-red-50 p-4 text-sm text-red-800">
             <p className="font-semibold">Unable to load dunning state</p>
@@ -339,10 +346,10 @@ export const DunningAlertBanner: React.FC<DunningAlertBannerProps> = ({
 
   return (
     <div
-      className={className}
+      className={`gp-dunning-alert ${className ?? ''}`}
       role="alert"
       aria-live="polite"
-      data-testid="dunning-alert-banner"
+      data-testid="dunning-alert-banner" data-state={bannerState}
     >
       <div className="rounded-lg border border-amber-300 bg-amber-50 p-4">
         <div className="flex flex-wrap items-start justify-between gap-3">

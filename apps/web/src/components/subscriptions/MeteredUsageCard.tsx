@@ -191,7 +191,7 @@ const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
         <div className="modal__actions">
           <button
             type="button"
-            className="btn btn--secondary"
+            className="btn btn-outline"
             onClick={onCancel}
             disabled={busy}
           >
@@ -199,7 +199,7 @@ const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
           </button>
           <button
             type="button"
-            className="btn btn--primary"
+            className="btn btn-primary"
             onClick={onConfirm}
             disabled={busy}
             data-testid="confirm-dialog-confirm"
@@ -220,7 +220,6 @@ export const MeteredUsageCard: React.FC<MeteredUsageCardProps> = ({
   reportUsage,
   setBillingCap,
   onUpdated,
-  ledgerTimestamp,
 }) => {
   const [usage, setUsage] = useState<MeteredUsage | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
@@ -254,7 +253,7 @@ export const MeteredUsageCard: React.FC<MeteredUsageCardProps> = ({
         next.softCap > ZERO ? formatAmount(next.softCap, next.decimals ?? 7, undefined) : '',
       );
     } catch (err) {
-      setLoadError(decodeGridPayError(err));
+      setLoadError(decodeGridPayError(err).message);
     } finally {
       setLoading(false);
     }
@@ -267,6 +266,14 @@ export const MeteredUsageCard: React.FC<MeteredUsageCardProps> = ({
   const projectedInvoice = useMemo<bigint>(() => {
     if (!usage) return ZERO;
     return usage.currentUsage * usage.unitPrice;
+  }, [usage]);
+
+  const capState = useMemo<'active' | 'metered-near-cap' | 'metered-capped'>(() => {
+    if (!usage || usage.hardCap <= ZERO) return 'active';
+    const ratio = (usage.currentUsage * BigInt(10_000)) / usage.hardCap;
+    if (ratio >= BigInt(10_000)) return 'metered-capped';
+    if (ratio >= BigInt(8_000)) return 'metered-near-cap';
+    return 'active';
   }, [usage]);
 
   const periodLabel = useMemo(() => {
@@ -309,7 +316,7 @@ export const MeteredUsageCard: React.FC<MeteredUsageCardProps> = ({
         await refresh();
         onUpdated?.();
       } catch (err) {
-        setReportError(decodeGridPayError(err));
+        setReportError(decodeGridPayError(err).message);
       } finally {
         setReportBusy(false);
       }
@@ -397,7 +404,7 @@ export const MeteredUsageCard: React.FC<MeteredUsageCardProps> = ({
       await refresh();
       onUpdated?.();
     } catch (err) {
-      setCapError(decodeGridPayError(err));
+      setCapError(decodeGridPayError(err).message);
       setConfirmCapOpen(false);
     } finally {
       setCapBusy(false);
@@ -440,7 +447,7 @@ export const MeteredUsageCard: React.FC<MeteredUsageCardProps> = ({
 
   if (loading && !usage) {
     return (
-      <div className="metered-usage-card" data-testid="metered-usage-card">
+      <div className="metered-usage-card" data-testid="metered-usage-card" data-state={capState}>
         <p>Loading metered usage…</p>
       </div>
     );
@@ -448,11 +455,11 @@ export const MeteredUsageCard: React.FC<MeteredUsageCardProps> = ({
 
   if (loadError && !usage) {
     return (
-      <div className="metered-usage-card" data-testid="metered-usage-card">
+      <div className="metered-usage-card" data-testid="metered-usage-card" data-state={capState}>
         <p className="error" role="alert">
           Failed to load usage: {loadError}
         </p>
-        <button type="button" className="btn btn--secondary" onClick={() => void refresh()}>
+        <button type="button" className="btn btn-outline" onClick={() => void refresh()}>
           Retry
         </button>
       </div>
@@ -461,18 +468,37 @@ export const MeteredUsageCard: React.FC<MeteredUsageCardProps> = ({
 
   if (!usage) {
     return (
-      <div className="metered-usage-card" data-testid="metered-usage-card">
+      <div className="metered-usage-card" data-testid="metered-usage-card" data-state={capState}>
         <p>No metered usage data available.</p>
       </div>
     );
   }
 
   return (
-    <div className="metered-usage-card" data-testid="metered-usage-card">
+    <div className="metered-usage-card" data-testid="metered-usage-card" data-state={capState}>
       <header className="metered-usage-card__header">
         <h3 className="metered-usage-card__title">Metered Usage</h3>
         <span className="metered-usage-card__period">{periodLabel}</span>
       </header>
+
+      {capState !== 'active' && (
+        <div
+          className={`gp-usage-alert gp-usage-alert--${capState}`}
+          role="alert"
+          data-testid="metered-cap-alert"
+        >
+          <strong>
+            {capState === 'metered-capped'
+              ? 'Hard cap reached — usage is blocked until the cap is raised.'
+              : 'Approaching hard cap — usage may be blocked soon.'}
+          </strong>
+          <span>
+            {capState === 'metered-capped'
+              ? 'Contact the merchant to raise the cap or wait for the next billing period.'
+              : 'Consider raising the cap before the meter fills.'}
+          </span>
+        </div>
+      )}
 
       <section className="metered-usage-card__summary">
         <div className="metered-usage-card__stat">
@@ -547,7 +573,7 @@ export const MeteredUsageCard: React.FC<MeteredUsageCardProps> = ({
             )}
             <button
               type="submit"
-              className="btn btn--primary"
+              className="btn btn-primary"
               disabled={reportBusy || reportInput.trim() === ''}
               data-testid="report-usage-submit"
             >
@@ -601,7 +627,7 @@ export const MeteredUsageCard: React.FC<MeteredUsageCardProps> = ({
             )}
             <button
               type="submit"
-              className="btn btn--primary"
+              className="btn btn-primary"
               disabled={capBusy}
               data-testid="cap-submit"
             >

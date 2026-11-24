@@ -274,3 +274,55 @@ pub fn bump_prepaid_vault(env: &Env, key: &PrepaidVaultKey) {
         extend_persistent(env, key);
     }
 }
+
+// ============================================================================
+// STOREFRONT AND TARIFF STORAGE
+// ============================================================================
+
+/// Storefront configs and per-token balances live in persistent storage so an
+/// unbounded number of storefronts never grows the contract instance footprint.
+pub fn get_storefront_config<K>(env: &Env, key: &K) -> Option<crate::StorefrontConfig>
+where
+    K: IntoVal<Env, Val>,
+    crate::StorefrontConfig: TryFromVal<Env, Val>,
+{
+    get_persistent(env, key)
+}
+
+pub fn set_storefront_config<K>(env: &Env, key: &K, config: &crate::StorefrontConfig)
+where
+    K: IntoVal<Env, Val>,
+    crate::StorefrontConfig: IntoVal<Env, Val>,
+{
+    set_persistent(env, key, config);
+}
+
+pub fn get_storefront_balance<K>(env: &Env, key: &K) -> i128
+where
+    K: IntoVal<Env, Val>,
+{
+    get_persistent::<K, i128>(env, key).unwrap_or(0)
+}
+
+pub fn set_storefront_balance<K>(env: &Env, key: &K, balance: i128)
+where
+    K: IntoVal<Env, Val>,
+{
+    set_persistent(env, key, &balance);
+}
+
+pub fn get_tariff_schedule<K>(env: &Env, key: &K) -> Option<crate::TariffSchedule>
+where
+    K: IntoVal<Env, Val>,
+    crate::TariffSchedule: TryFromVal<Env, Val>,
+{
+    get_persistent(env, key)
+}
+
+pub fn set_tariff_schedule<K>(env: &Env, key: &K, schedule: &crate::TariffSchedule)
+where
+    K: IntoVal<Env, Val>,
+    crate::TariffSchedule: IntoVal<Env, Val>,
+{
+    set_persistent(env, key, schedule);
+}
