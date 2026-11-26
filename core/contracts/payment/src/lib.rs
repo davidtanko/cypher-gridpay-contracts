@@ -64,6 +64,14 @@ pub enum ConfigKey {
     AllowedTokens,
     MaxForwardDepth,
     RelayerStipendBps,
+    /// Persistent: progress of a batched schema migration.
+    MigrationCursor,
+    /// Instance: true while a batched migration is running.
+    MigrationInProgress,
+    /// Sharded token whitelist: number of shards (persistent).
+    TokenWhitelistCount,
+    /// Sharded token whitelist: a single shard of addresses.
+    TokenWhitelistShard(u32),
     TokenWhitelistShard(u32),
     TokenWhitelistCount,
     TokenLifecycle(Address),
@@ -219,6 +227,14 @@ pub enum BasicError {
     // Issue #3: a string field contains raw PII (email, phone, or tax ID)
     // that must not be stored on the immutable public ledger.
     PiiDetected = 128,
+    /// A reentrant call was detected during a fund-moving entry point.
+    ReentrantCallDetected = 129,
+    /// `migrate_schema_step` was called with a batch size of 0.
+    InvalidMigrationBatch = 130,
+    /// A batched schema migration is running; state-changing entry points are blocked.
+    MigrationInProgress = 131,
+    /// Daily tier volume limit exceeded for this merchant.
+    DailyTierLimitExceeded = 132,
 }
 
 /// Errors relating to payment lifecycle, settlement, and scheduling.
@@ -286,6 +302,20 @@ pub enum PaymentError {
     FinalityWindowClosed = 228,
     /// Invalid finality risk configuration (#196).
     InvalidFinalityRiskConfig = 229,
+    /// Pre-authorization hold not found. Verify the auth ID (#426).
+    PreAuthNotFound = 230,
+    /// Pre-authorization has already been captured (#426).
+    PreAuthAlreadyCaptured = 231,
+    /// Pre-authorization has already been voided (#426).
+    PreAuthAlreadyVoided = 232,
+    /// Pre-authorization has expired (#426).
+    PreAuthExpired = 233,
+    /// Pre-authorization has not expired yet (#426).
+    PreAuthNotExpired = 234,
+    /// Capture amount exceeds the authorized maximum (#426).
+    CaptureExceedsMax = 235,
+    /// Capture amount must be strictly positive (#426).
+    InvalidCaptureAmount = 236,
 }
 
 /// Errors relating to recurring subscription plans, dunning cycles, and billing.
@@ -580,13 +610,13 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 400 && code <= 406 {
                 return Ok(Error::Proposal(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 300 && code <= 318 {
+            if code >= 300 && code <= 323 {
                 return Ok(Error::Subscription(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 200 && code <= 229 {
+            if code >= 200 && code <= 236 {
                 return Ok(Error::Payment(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 100 && code <= 128 {
+            if code >= 100 && code <= 132 {
                 return Ok(Error::Basic(unsafe { core::mem::transmute(code) }));
             }
         }
@@ -631,6 +661,10 @@ pub enum CustomerDataKey {
     HourCount(Address, u32),
     /// Waived-transaction counter per promotional campaign and customer address.
     FeeWaiverUses(u64, Address),
+    /// Rolling velocity-window start timestamp for structuring detection.
+    VelocityWindowStart(Address),
+    /// Accumulated volume within the rolling velocity window.
+    VelocityWindowVolume(Address),
 }
 
 // Merchant-specific data keys
@@ -682,6 +716,9 @@ pub enum StateDataKey {
     PartialPaymentRecord(u64, u32), // payment_id, installment_number
     SettlementFinalized(u64),
     ScheduledPaymentCounter,
+    // Pre-authorization holds (#426)
+    PreAuth(u64),
+    PreAuthCounter,
     RebatePool(u64),
     RebatePoolCounter,
     RebateClaimedBitmap(u64, u32),
@@ -705,6 +742,20 @@ pub enum PaymentStatus {
     Refunded,
     PartialRefunded,
     Cancelled,
+}
+
+/// Lifecycle status of a pre-authorization hold (#426).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum PreAuthStatus {
+    /// Funds are locked in the contract awaiting capture or void.
+    Authorized,
+    /// A partial or full capture has been settled; remainder refunded.
+    Captured,
+    /// The hold was voided and all locked funds returned to the customer.
+    Voided,
+    /// The hold expired without capture; funds released back to the customer.
+    Expired,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1085,6 +1136,37 @@ pub struct PaymentCancelled {
     pub payment_id: u64,
     pub cancelled_by: Address,
     pub timestamp: u64,
+}
+
+// ── Pre-authorization hold events (#426) ────────────────────────────────────
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreAuthCreated {
+    pub auth_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub max_amount: i128,
+    pub expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreAuthCaptured {
+    pub auth_id: u64,
+    pub merchant: Address,
+    pub capture_amount: i128,
+    pub fee_amount: i128,
+    pub refund_amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreAuthVoided {
+    pub auth_id: u64,
+    pub voided_by: Address,
+    pub refund_amount: i128,
 }
 
 #[contractevent]
@@ -1627,6 +1709,39 @@ pub struct Payment {
     pub metadata: String,
     pub notes: String,
     pub refunded_amount: i128,
+}
+
+/// Pre-authorization hold record (#426).
+///
+/// Reserves `max_amount` of the customer's tokens inside the contract. A
+/// later `capture_payment` settles only the consumed `captured_amount` (net of
+/// protocol fee) and atomically refunds the remainder. `void_authorization`
+/// releases the full hold.
+#[derive(Clone)]
+#[contracttype]
+pub struct PreAuthPayment {
+    /// Unique identifier returned by `authorize_payment`.
+    pub auth_id: u64,
+    /// The customer whose tokens are locked.
+    pub customer: Address,
+    /// The merchant authorised to capture from the hold.
+    pub merchant: Address,
+    /// The token whose `max_amount` was locked.
+    pub token: Address,
+    /// Maximum amount reserved upfront.
+    pub max_amount: i128,
+    /// Amount actually captured (0 until `capture_payment` runs).
+    pub captured_amount: i128,
+    /// Protocol fee charged on `captured_amount` only, never `max_amount`.
+    pub fee_amount: i128,
+    /// Ledger timestamp after which the hold may be expired/reclaimed.
+    pub expires_at: u64,
+    /// Ledger timestamp the hold was created.
+    pub created_at: u64,
+    /// Current lifecycle state.
+    pub status: PreAuthStatus,
+    /// Arbitrary merchant/customer reference string.
+    pub metadata: String,
 }
 
 #[derive(Clone)]
@@ -2441,6 +2556,11 @@ const MAX_TRIAL_DURATION: u64 = 90 * SECONDS_PER_DAY; // 90 days max trial
 const MAX_TRIAL_NOTICE_LEAD_SECS: u64 = 30 * SECONDS_PER_DAY;
 const DEFAULT_TRIAL_NOTICE_MIN_LEAD_SECS: u64 = SECONDS_PER_DAY;
 const POST_TRIAL_CANCEL_GRACE_SECS: u64 = SECONDS_PER_DAY;
+/// Dispute grace period that a pending payment's TTL must outlive beyond its
+/// expiry, ensuring the instance stays live long enough for dispute handling.
+const PAYMENT_DISPUTE_GRACE_SECS: u64 = 7 * SECONDS_PER_DAY;
+/// Maximum number of payment IDs `batch_bump_critical` accepts per call.
+const MAX_TTL_BUMP_BATCH: u32 = 50;
 const MAX_STOREFRONTS_PER_MERCHANT: u32 = 64;
 const MAX_TARIFF_BANDS: u32 = 8;
 const MINUTES_PER_DAY: u32 = 1440;
@@ -3549,9 +3669,9 @@ impl PaymentContract {
                 payment_id,
             )))
             .ok_or(Error::Payment(PaymentError::NotFound))?;
-        let mut reveal = vault.to_xdr(&env);
+        let mut reveal = vault.clone().to_xdr(&env);
         reveal.append(&secret.to_xdr(&env));
-        if env.crypto().sha256(&reveal) != route.ephemeral_invoice_commitment {
+        if env.crypto().sha256(&reveal).to_bytes() != route.ephemeral_invoice_commitment {
             return Err(Error::Payment(PaymentError::HashMismatch));
         }
 
@@ -7661,7 +7781,7 @@ impl PaymentContract {
 
     /// Record customer consent for a new trial conversion amount.
     /// Any previous conversion notice is invalidated and must be emitted again.
-    pub fn authorize_trial_conversion_amount(
+    pub fn authorize_trial_conversion(
         env: Env,
         customer: Address,
         subscription_id: u64,
@@ -7743,7 +7863,7 @@ impl PaymentContract {
             .trial_data
             .post_conversion_usage_units
             .checked_add(units)
-            .ok_or(Error::Basic(BasicError::BillingOverflow))?;
+            .ok_or(Error::Payment(PaymentError::BillingOverflow))?;
         let accumulated_units = sub.trial_data.post_conversion_usage_units;
 
         env.storage().instance().set(
@@ -16378,6 +16498,311 @@ impl PaymentContract {
         Ok(())
     }
 
+    // ── Pre-Authorization Hold & Partial Capture (#426) ─────────────────────────
+
+    /// Creates a pre-authorization hold that locks `max_amount` of the
+    /// customer's tokens inside the contract until the merchant captures part
+    /// or all of it, the hold is voided, or it expires (#426).
+    ///
+    /// The customer must authorize. The token must be whitelisted and the
+    /// merchant must not be paused. The full `max_amount` is pulled from the
+    /// customer into the contract via `transfer_from`.
+    ///
+    /// # Arguments
+    /// * `customer` - The customer whose tokens are locked (must authorize).
+    /// * `merchant` - The merchant who may later capture from the hold.
+    /// * `token` - The token address to lock.
+    /// * `max_amount` - The maximum amount to reserve (must be > 0).
+    /// * `expires_at` - Ledger timestamp after which anyone may reclaim the hold.
+    /// * `metadata` - Arbitrary reference string (max 512 bytes).
+    ///
+    /// # Returns
+    /// `Ok(auth_id)` on success, or an error if the token is not allowed, the
+    /// amount is invalid, the metadata is too large, the customer is flagged,
+    /// spend or tier limits are exceeded, or the contract is paused.
+    pub fn authorize_payment(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        token: Address,
+        max_amount: i128,
+        expires_at: u64,
+        metadata: String,
+    ) -> Result<u64, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env)
+            .map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
+        Self::require_not_paused(&env, "authorize_payment")?;
+        Self::require_merchant_not_paused(&env, &merchant)?;
+        customer.require_auth();
+
+        if max_amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        if !PaymentContract::is_token_allowed(&env, &token) {
+            return Err(Error::Payment(PaymentError::TokenNotAllowed));
+        }
+        if metadata.len() > MAX_METADATA_SIZE {
+            return Err(Error::Basic(BasicError::MetadataTooLarge));
+        }
+        let now = env.ledger().timestamp();
+        if expires_at <= now {
+            return Err(Error::Payment(PaymentError::InvalidScheduleTime));
+        }
+
+        // Enforce sanctions/flag checks.
+        if PaymentContract::is_address_flagged(env.clone(), customer.clone())
+            && !PaymentContract::is_allowlisted(&env, &customer)
+        {
+            return Err(Error::Basic(BasicError::AddressFlagged));
+        }
+
+        // Check customer spend limit and merchant tier volume.
+        PaymentContract::check_and_update_spend_limit(&env, &customer, max_amount)?;
+        PaymentContract::check_and_update_daily_tier_volume(&env, &merchant, max_amount)?;
+
+        // ── Effects: create the hold record before the external transfer ──
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::State(StateDataKey::PreAuthCounter))
+            .unwrap_or(0);
+        let auth_id = counter + 1;
+
+        let preauth = PreAuthPayment {
+            auth_id,
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            token: token.clone(),
+            max_amount,
+            captured_amount: 0,
+            fee_amount: 0,
+            expires_at,
+            created_at: now,
+            status: PreAuthStatus::Authorized,
+            metadata: metadata.clone(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::State(StateDataKey::PreAuth(auth_id)), &preauth);
+        env.storage()
+            .instance()
+            .set(&DataKey::State(StateDataKey::PreAuthCounter), &auth_id);
+
+        // ── Interaction: lock max_amount from customer into the contract ──
+        let token_client = token::Client::new(&env, &token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer_from(&contract_address, &customer, &contract_address, &max_amount);
+
+        (PreAuthCreated {
+            auth_id,
+            customer,
+            merchant,
+            token,
+            max_amount,
+            expires_at,
+        })
+        .publish(&env);
+
+        Ok(auth_id)
+    }
+
+    /// Captures `capture_amount` from a pre-authorization hold, crediting the
+    /// merchant net of the protocol fee and atomically refunding the unused
+    /// remainder (`max_amount - capture_amount`) to the customer (#426).
+    ///
+    /// The fee is calculated on `capture_amount` only, never `max_amount`.
+    /// The hold must be in `Authorized` status and the current time must not
+    /// exceed `expires_at`.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant authorised on the hold (must authorize).
+    /// * `auth_id` - The pre-authorization ID returned by `authorize_payment`.
+    /// * `capture_amount` - The amount to capture (`0 < capture_amount <= max_amount`).
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an error if the hold is not found, already
+    /// captured/voided, expired, the capture amount is invalid, or the caller
+    /// is not the authorised merchant.
+    pub fn capture_payment(
+        env: Env,
+        merchant: Address,
+        auth_id: u64,
+        capture_amount: i128,
+    ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env)
+            .map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
+        Self::require_not_paused(&env, "capture_payment")?;
+        merchant.require_auth();
+
+        if capture_amount <= 0 {
+            return Err(Error::Payment(PaymentError::InvalidCaptureAmount));
+        }
+
+        // ── Checks ──
+        let mut preauth: PreAuthPayment = env
+            .storage()
+            .instance()
+            .get(&DataKey::State(StateDataKey::PreAuth(auth_id)))
+            .ok_or(Error::Payment(PaymentError::PreAuthNotFound))?;
+
+        if preauth.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if preauth.status != PreAuthStatus::Authorized {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+        if capture_amount > preauth.max_amount {
+            return Err(Error::Payment(PaymentError::CaptureExceedsMax));
+        }
+        let now = env.ledger().timestamp();
+        if now > preauth.expires_at {
+            return Err(Error::Payment(PaymentError::PreAuthExpired));
+        }
+
+        // Fee is computed on capture_amount only, never max_amount.
+        let fee = PaymentContract::calculate_fee(
+            env.clone(),
+            capture_amount,
+            preauth.merchant.clone(),
+            preauth.customer.clone(),
+            Currency::USDC,
+        );
+        let merchant_net = capture_amount.saturating_sub(fee);
+        let refund = preauth.max_amount.saturating_sub(capture_amount);
+
+        // ── Effects: update hold state and accumulated fees before transfers ──
+        preauth.captured_amount = capture_amount;
+        preauth.fee_amount = fee;
+        preauth.status = PreAuthStatus::Captured;
+        env.storage()
+            .instance()
+            .set(&DataKey::State(StateDataKey::PreAuth(auth_id)), &preauth);
+
+        if fee > 0 {
+            let accumulated: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Payment(PaymentKey::AccumulatedFees))
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::Payment(PaymentKey::AccumulatedFees),
+                &(accumulated + fee),
+            );
+            PaymentContract::update_merchant_fee_record_post_completion(
+                &env,
+                preauth.merchant.clone(),
+                capture_amount,
+                fee,
+            );
+            (FeeCollected {
+                payment_id: auth_id,
+                fee_amount: fee,
+                merchant: preauth.merchant.clone(),
+            })
+            .publish(&env);
+        }
+
+        // ── Interactions: pay merchant and refund customer ──
+        let token_client = token::Client::new(&env, &preauth.token);
+        let contract_address = env.current_contract_address();
+        if merchant_net > 0 {
+            token_client.transfer(&contract_address, &preauth.merchant, &merchant_net);
+        }
+        if refund > 0 {
+            token_client.transfer(&contract_address, &preauth.customer, &refund);
+        }
+
+        (PreAuthCaptured {
+            auth_id,
+            merchant: preauth.merchant.clone(),
+            capture_amount,
+            fee_amount: fee,
+            refund_amount: refund,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Voids a pre-authorization hold, returning the full locked `max_amount`
+    /// to the customer (#426).
+    ///
+    /// The merchant may void at any time while the hold is `Authorized`.
+    /// After `expires_at`, anyone (including the customer) may release the
+    /// expired hold.
+    ///
+    /// # Arguments
+    /// * `caller` - The caller voiding the hold (must authorize).
+    /// * `auth_id` - The pre-authorization ID to void.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an error if the hold is not found, already
+    /// captured/voided, or the caller is not authorized.
+    pub fn void_authorization(env: Env, caller: Address, auth_id: u64) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env)
+            .map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
+        Self::require_not_paused(&env, "void_authorization")?;
+        caller.require_auth();
+
+        // ── Checks ──
+        let mut preauth: PreAuthPayment = env
+            .storage()
+            .instance()
+            .get(&DataKey::State(StateDataKey::PreAuth(auth_id)))
+            .ok_or(Error::Payment(PaymentError::PreAuthNotFound))?;
+
+        if preauth.status != PreAuthStatus::Authorized {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        let now = env.ledger().timestamp();
+        let is_expired = now > preauth.expires_at;
+
+        // Authorization rules (#426):
+        //  - Merchant may void immediately (before expiry).
+        //  - Anyone may release the hold once it has expired.
+        if !is_expired {
+            if caller != preauth.merchant {
+                return Err(Error::Basic(BasicError::Unauthorized));
+            }
+        }
+
+        // ── Effects: mark as voided/expired before the transfer ──
+        preauth.status = if is_expired {
+            PreAuthStatus::Expired
+        } else {
+            PreAuthStatus::Voided
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::State(StateDataKey::PreAuth(auth_id)), &preauth);
+
+        // ── Interaction: refund the full max_amount to the customer ──
+        let token_client = token::Client::new(&env, &preauth.token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&contract_address, &preauth.customer, &preauth.max_amount);
+
+        (PreAuthVoided {
+            auth_id,
+            voided_by: caller,
+            refund_amount: preauth.max_amount,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Retrieves the details of a pre-authorization hold (#426).
+    ///
+    /// # Arguments
+    /// * `auth_id` - The pre-authorization ID to look up.
+    ///
+    /// # Returns
+    /// `Some(PreAuthPayment)` if the hold exists, or `None` otherwise.
+    pub fn get_preauth(env: Env, auth_id: u64) -> Option<PreAuthPayment> {
+        env.storage()
+            .instance()
+            .get(&DataKey::State(StateDataKey::PreAuth(auth_id)))
     // ------------------------------------------------------------------------
     // Issue #428 — storefront virtual sub-ledgers
     // ------------------------------------------------------------------------
@@ -16942,4 +17367,5 @@ mod test_addon;
 mod test_completion_fee_parity;
 
 #[cfg(test)]
+mod test_preauth;
 mod test_rebate_pool;
