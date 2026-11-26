@@ -1,6 +1,6 @@
 // Core types and data structures for the payment contract
 
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Symbol, Vec};
 
 use crate::storage::MerchantDataKey;
 
@@ -678,6 +678,8 @@ pub struct MeteredSubscription {
     pub billing_cap: Option<i128>,
     pub last_reset_at: u64,
     pub max_units_per_period: Option<u64>,
+    /// Accrued cost of TOU-priced usage in the current billing cycle.
+    pub accumulated_cost: i128,
 }
 
 // ============================================================================
@@ -765,6 +767,44 @@ pub struct PaymentMemo {
 // ============================================================================
 // PLACEHOLDER STRUCT FOR CONTRACT MARKER
 // ============================================================================
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct StorefrontConfig {
+    pub storefront_id: Symbol,
+    pub parent_merchant: Address,
+    pub payout_destination: Address,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct StorefrontPaymentRoute {
+    pub parent_merchant: Address,
+    pub storefront_id: Symbol,
+}
+
+// ============================================================================
+// TIME-OF-USE TARIFFS
+// ============================================================================
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct TariffBand {
+    pub start_minute_utc: u32,
+    pub end_minute_utc: u32,
+    pub rate_per_unit: i128,
+    pub weekend_discount_bps: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct TariffSchedule {
+    pub schedule_id: u64,
+    pub bands: Vec<TariffBand>,
+    pub effective_from: u64,
+    pub active: bool,
+}
 
 #[derive(Clone)]
 pub struct PaymentContract;
