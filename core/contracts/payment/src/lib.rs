@@ -7,7 +7,7 @@ extern crate std;
 use escrow::EscrowContractClient;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, token, xdr::ToXdr, Address,
-    Bytes, BytesN, Env, String, Symbol, TryFromVal, Val, Vec,
+    Bytes, BytesN, Env, String, Symbol, TryFromVal, U256, Val, Vec,
 };
 
 pub mod reentrancy;
@@ -142,6 +142,9 @@ pub enum FeatureKey {
     PrepaidVault(u64),
     PrepaidVaultCounter,
     PrepaidLiability(Address),
+    TariffSchedule(u64),
+    TariffScheduleCounter,
+    SubscriptionTariff(u64),
 }
 
 #[derive(Clone)]
@@ -154,6 +157,9 @@ pub enum DataKey {
     Customer(CustomerDataKey),
     Merchant(MerchantDataKey),
     State(StateDataKey),
+    StorefrontConfig(Address, Symbol),
+    /// Isolated balance for (merchant, storefront_id, token), issue #428.
+    StorefrontBalance(Address, Symbol, Address),
 }
 
 /// Protocol-level administrative and execution errors for PaymentContract.
@@ -511,6 +517,39 @@ pub enum FeatureError {
     InvalidTokenLifecycleApprovals = 547,
 }
 
+/// Issue #428: storefront sub-ledger errors. Kept in a separate enum because
+/// Soroban caps each `#[contracterror]` enum at 50 variants.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(u32)]
+#[contracterror]
+pub enum StorefrontError {
+    /// Storefront is not registered under this merchant.
+    NotFound = 600,
+    /// Storefront is deactivated; incoming payments are rejected.
+    Inactive = 601,
+    /// Merchant has reached the maximum number of storefronts.
+    LimitExceeded = 602,
+    /// Storefront ID is already registered under this merchant.
+    AlreadyExists = 603,
+    /// Storefront has less than the requested sweep amount.
+    InsufficientBalance = 604,
+    /// Sweep amount must be positive.
+    InvalidAmount = 605,
+}
+
+/// Issue #427: time-of-use tariff errors.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(u32)]
+#[contracterror]
+pub enum TariffError {
+    /// Bands must be bounded, disjoint, and cover [0, 1440) exactly once.
+    InvalidSchedule = 700,
+    /// Schedule not found or no longer active.
+    ScheduleNotFound = 701,
+    /// Tariff cannot reprice usage already reported in the current cycle.
+    NotAttachable = 702,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Error {
     Basic(BasicError),
@@ -518,6 +557,8 @@ pub enum Error {
     Subscription(SubscriptionError),
     Proposal(ProposalError),
     Feature(FeatureError),
+    Storefront(StorefrontError),
+    Tariff(TariffError),
 }
 
 impl Error {
@@ -533,6 +574,8 @@ impl Error {
             Error::Subscription(e) => *e as u32,
             Error::Proposal(e) => *e as u32,
             Error::Feature(e) => *e as u32,
+            Error::Storefront(e) => *e as u32,
+            Error::Tariff(e) => *e as u32,
         }
     }
 }
@@ -554,6 +597,12 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
+            if code >= 600 && code <= 605 {
+                return Ok(Error::Storefront(unsafe { core::mem::transmute(code) }));
+            }
+            if code >= 700 && code <= 702 {
+                return Ok(Error::Tariff(unsafe { core::mem::transmute(code) }));
+            }
             if code >= 500 && code <= 552 {
             if code >= 500 && code <= 548 {
                 return Ok(Error::Feature(unsafe { core::mem::transmute(code) }));
@@ -643,6 +692,9 @@ pub enum MerchantDataKey {
     ActiveSubscriptionIndex(u64),
     // Issue #23: 24-hour aggregate transaction volume per merchant, bucketed by day
     DailyVolume(Address, u64),
+    // Issue #428: storefront cap and payment→storefront routing.
+    StorefrontCount(Address),
+    StorefrontPayment(u64),
 }
 
 // State and proposal data keys
@@ -1023,6 +1075,47 @@ pub struct PaymentCreated {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorefrontPaymentCreated {
+    pub payment_id: u64,
+    pub merchant: Address,
+    pub storefront_id: Symbol,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorefrontBalanceSwept {
+    pub merchant: Address,
+    pub storefront_id: Symbol,
+    pub token: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TariffScheduleCreated {
+    pub schedule_id: u64,
+    pub merchant: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TariffAttached {
+    pub subscription_id: u64,
+    pub schedule_id: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TouUsageReported {
+    pub subscription_id: u64,
+    pub units: u64,
+    pub cost: i128,
+    pub band_start_minute_utc: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaymentCompleted {
     pub payment_id: u64,
     pub merchant: Address,
@@ -1254,6 +1347,42 @@ pub struct MeteredSubscription {
     pub billing_cap: Option<i128>,
     pub last_reset_at: u64,
     pub max_units_per_period: Option<u64>,
+    /// TOU-accrued cost for the current cycle; 0 when no tariff is attached.
+    pub accumulated_cost: i128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct StorefrontConfig {
+    pub storefront_id: Symbol,
+    pub parent_merchant: Address,
+    pub payout_destination: Address,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct StorefrontPaymentRoute {
+    pub parent_merchant: Address,
+    pub storefront_id: Symbol,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct TariffBand {
+    pub start_minute_utc: u32,
+    pub end_minute_utc: u32,
+    pub rate_per_unit: i128,
+    pub weekend_discount_bps: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct TariffSchedule {
+    pub schedule_id: u64,
+    pub bands: Vec<TariffBand>,
+    pub effective_from: u64,
+    pub active: bool,
 }
 
 #[derive(Clone)]
@@ -2432,6 +2561,9 @@ const POST_TRIAL_CANCEL_GRACE_SECS: u64 = SECONDS_PER_DAY;
 const PAYMENT_DISPUTE_GRACE_SECS: u64 = 7 * SECONDS_PER_DAY;
 /// Maximum number of payment IDs `batch_bump_critical` accepts per call.
 const MAX_TTL_BUMP_BATCH: u32 = 50;
+const MAX_STOREFRONTS_PER_MERCHANT: u32 = 64;
+const MAX_TARIFF_BANDS: u32 = 8;
+const MINUTES_PER_DAY: u32 = 1440;
 
 // Fee tier volume thresholds (raw token units)
 const PREMIUM_VOLUME_THRESHOLD: i128 = 10_000;
@@ -5402,13 +5534,26 @@ impl PaymentContract {
             payment.currency.clone(),
         );
 
+        // Storefront settlements are held in their own sub-ledger until the
+        // parent merchant sweeps them, so the immediate-payout finality hold
+        // does not apply (issue #428).
+        let storefront_route: Option<StorefrontPaymentRoute> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::StorefrontPayment(
+                payment_id,
+            )));
+
         // Check finality delay config (#219)
         let finality: Option<FinalityConfig> = env
             .storage()
             .instance()
             .get(&DataKey::Config(ConfigKey::FinalityConfig));
         if let Some(ref fc) = finality {
-            if fc.active && payment.amount >= fc.min_amount_threshold {
+            if storefront_route.is_none()
+                && fc.active
+                && payment.amount >= fc.min_amount_threshold
+            {
                 // Hold funds — create PendingSettlement instead of transferring
                 let release_at = env.ledger().timestamp()
                     + finality::compute_required_finality_delay(env, &payment, fc.delay_seconds);
@@ -5523,15 +5668,32 @@ impl PaymentContract {
             &merchant_amount,
         );
 
-        PaymentContract::settle_or_accumulate(
-            env,
-            payment.merchant.clone(),
-            payment.token.clone(),
-            merchant_amount,
-        )?;
+        if let Some(ref route) = storefront_route {
+            // Credit the isolated (merchant, storefront, token) sub-ledger
+            // instead of the parent's flat payout schedule (issue #428).
+            let balance_key = DataKey::StorefrontBalance(
+                route.parent_merchant.clone(),
+                route.storefront_id.clone(),
+                payment.token.clone(),
+            );
+            let balance: i128 = storage::get_storefront_balance(env, &balance_key);
+            storage::set_storefront_balance(
+                env,
+                &balance_key,
+                balance.saturating_add(merchant_amount),
+            );
+            Self::increase_token_liability(env, &payment.token, merchant_amount);
+        } else {
+            PaymentContract::settle_or_accumulate(
+                env,
+                payment.merchant.clone(),
+                payment.token.clone(),
+                merchant_amount,
+            )?;
+        }
 
         // Forwarding only applies when funds were paid out immediately.
-        let payout_deferred = env
+        let payout_deferred = storefront_route.is_some() || env
             .storage()
             .instance()
             .get::<DataKey, PayoutSchedule>(&DataKey::Merchant(MerchantDataKey::PayoutSchedule(
@@ -6768,7 +6930,7 @@ impl PaymentContract {
         Self::require_token_admin(&env, &admin)?;
 
         if Self::token_status(&env, &token) == TokenLifecycleStatus::Removed {
-            return Err(Error::Feature(FeatureError::TokenLifecycleRequiresMultiSig));
+            return Err(Error::Feature(FeatureError::InvalidTokenLifecycleTransition));
         }
 
         let mut tokens = Self::load_allowed_tokens(&env);
@@ -8067,6 +8229,7 @@ impl PaymentContract {
             billing_cap,
             last_reset_at: now,
             max_units_per_period,
+            accumulated_cost: 0,
         };
 
         env.storage().instance().set(
@@ -8236,10 +8399,18 @@ impl PaymentContract {
             return Ok(0);
         }
 
-        let mut amount = (units_billed as i128)
-            .checked_mul(sub.price_per_unit)
-            // .ok_or(Error::BillingOverflow)?;
-            .ok_or(Error::Payment(PaymentError::BillingOverflow))?;
+        // TOU subscriptions accrue cost per band at report time; flat-rate
+        // subscriptions keep the previous units * price calculation.
+        let has_tariff = env.storage().instance().has(&DataKey::Feature(
+            FeatureKey::SubscriptionTariff(subscription_id),
+        ));
+        let mut amount = if has_tariff {
+            sub.accumulated_cost
+        } else {
+            (units_billed as i128)
+                .checked_mul(sub.price_per_unit)
+                .ok_or(Error::Payment(PaymentError::BillingOverflow))?
+        };
 
         let mut cap_hit = false;
 
@@ -8255,6 +8426,7 @@ impl PaymentContract {
         token_client.transfer_from(&contract_address, &sub.customer, &sub.merchant, &amount);
 
         sub.accumulated_units = 0;
+        sub.accumulated_cost = 0;
         sub.last_reset_at = env.ledger().timestamp();
 
         env.storage().instance().set(
@@ -16631,6 +16803,468 @@ impl PaymentContract {
         env.storage()
             .instance()
             .get(&DataKey::State(StateDataKey::PreAuth(auth_id)))
+    // ------------------------------------------------------------------------
+    // Issue #428 — storefront virtual sub-ledgers
+    // ------------------------------------------------------------------------
+
+    fn storefront_config_key(merchant: &Address, storefront_id: &Symbol) -> DataKey {
+        DataKey::StorefrontConfig(merchant.clone(), storefront_id.clone())
+    }
+
+    fn storefront_balance_key(
+        merchant: &Address,
+        storefront_id: &Symbol,
+        token: &Address,
+    ) -> DataKey {
+        DataKey::StorefrontBalance(merchant.clone(), storefront_id.clone(), token.clone())
+    }
+
+    fn load_storefront_config(
+        env: &Env,
+        merchant: &Address,
+        storefront_id: &Symbol,
+    ) -> Result<StorefrontConfig, Error> {
+        let config = storage::get_storefront_config(
+            env,
+            &Self::storefront_config_key(merchant, storefront_id),
+        )
+        .ok_or(Error::Storefront(StorefrontError::NotFound))?;
+        if config.parent_merchant != *merchant {
+            return Err(Error::Storefront(StorefrontError::NotFound));
+        }
+        Ok(config)
+    }
+
+    /// Registers a virtual storefront under an already verified parent merchant.
+    /// Each storefront is a dedicated persistent entry; the per-merchant cap is
+    /// bounded by `MAX_STOREFRONTS_PER_MERCHANT` to protect instance storage.
+    pub fn register_storefront(
+        env: Env,
+        merchant: Address,
+        storefront_id: Symbol,
+        payout_destination: Address,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "register_storefront")?;
+        merchant.require_auth();
+
+        let count_key = DataKey::Merchant(MerchantDataKey::StorefrontCount(merchant.clone()));
+        let count: u32 = env.storage().instance().get(&count_key).unwrap_or(0);
+        if count >= MAX_STOREFRONTS_PER_MERCHANT {
+            return Err(Error::Storefront(StorefrontError::LimitExceeded));
+        }
+
+        let config_key = Self::storefront_config_key(&merchant, &storefront_id);
+        if storage::get_storefront_config(&env, &config_key).is_some() {
+            return Err(Error::Storefront(StorefrontError::AlreadyExists));
+        }
+
+        storage::set_storefront_config(
+            &env,
+            &config_key,
+            &StorefrontConfig {
+                storefront_id: storefront_id.clone(),
+                parent_merchant: merchant.clone(),
+                payout_destination,
+                active: true,
+            },
+        );
+        env.storage().instance().set(&count_key, &(count + 1));
+        Ok(())
+    }
+
+    /// Blocks new incoming storefront payments while leaving the balance
+    /// sweepable by the parent merchant.
+    pub fn deactivate_storefront(
+        env: Env,
+        merchant: Address,
+        storefront_id: Symbol,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        let config_key = Self::storefront_config_key(&merchant, &storefront_id);
+        let mut config = Self::load_storefront_config(&env, &merchant, &storefront_id)?;
+        config.active = false;
+        storage::set_storefront_config(&env, &config_key, &config);
+        Ok(())
+    }
+
+    /// Updates the address that receives swept storefront funds.
+    pub fn set_storefront_destination(
+        env: Env,
+        merchant: Address,
+        storefront_id: Symbol,
+        payout_destination: Address,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        let config_key = Self::storefront_config_key(&merchant, &storefront_id);
+        let mut config = Self::load_storefront_config(&env, &merchant, &storefront_id)?;
+        config.payout_destination = payout_destination;
+        storage::set_storefront_config(&env, &config_key, &config);
+        Ok(())
+    }
+
+    pub fn get_storefront_config(
+        env: Env,
+        merchant: Address,
+        storefront_id: Symbol,
+    ) -> Option<StorefrontConfig> {
+        storage::get_storefront_config(&env, &Self::storefront_config_key(&merchant, &storefront_id))
+    }
+
+    /// Returns the isolated balance for (merchant, storefront_id, token).
+    pub fn get_storefront_balance(
+        env: Env,
+        merchant: Address,
+        storefront_id: Symbol,
+        token: Address,
+    ) -> i128 {
+        storage::get_storefront_balance(
+            &env,
+            &Self::storefront_balance_key(&merchant, &storefront_id, &token),
+        )
+    }
+
+    /// Creates a payment whose settlement is credited to a storefront sub-ledger.
+    /// Compliance checks still run against the parent merchant, so multiple
+    /// storefronts cannot bypass the shared verification-tier daily volume cap.
+    pub fn create_storefront_payment(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        storefront_id: Symbol,
+        amount: i128,
+        token: Address,
+        currency: Currency,
+        expiration_duration: u64,
+        metadata: String,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "create_storefront_payment")?;
+        customer.require_auth();
+
+        let config = Self::load_storefront_config(&env, &merchant, &storefront_id)?;
+        if !config.active {
+            return Err(Error::Storefront(StorefrontError::Inactive));
+        }
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        let payment_id = Self::do_create_payment(
+            &env,
+            customer,
+            merchant.clone(),
+            amount,
+            token,
+            currency,
+            expiration_duration,
+            metadata,
+        )?;
+
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::StorefrontPayment(payment_id)),
+            &StorefrontPaymentRoute {
+                parent_merchant: merchant.clone(),
+                storefront_id: storefront_id.clone(),
+            },
+        );
+        (StorefrontPaymentCreated {
+            payment_id,
+            merchant,
+            storefront_id,
+            amount,
+        })
+        .publish(&env);
+        Ok(payment_id)
+    }
+
+    /// Sweeps part or all of a storefront balance to its configured payout
+    /// destination. Works for deactivated storefronts and requires parent auth.
+    pub fn sweep_storefront_balance(
+        env: Env,
+        merchant: Address,
+        storefront_id: Symbol,
+        token: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env)
+            .map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
+        Self::require_not_paused(&env, "sweep_storefront_balance")?;
+        merchant.require_auth();
+
+        let config = Self::load_storefront_config(&env, &merchant, &storefront_id)?;
+        if amount <= 0 {
+            return Err(Error::Storefront(StorefrontError::InvalidAmount));
+        }
+        let balance_key = Self::storefront_balance_key(&merchant, &storefront_id, &token);
+        let balance = storage::get_storefront_balance(&env, &balance_key);
+        if balance < amount {
+            return Err(Error::Storefront(
+                StorefrontError::InsufficientBalance,
+            ));
+        }
+
+        // Effect before interaction: zero/debit the ledger entry first.
+        let remaining = balance - amount;
+        storage::set_storefront_balance(&env, &balance_key, remaining);
+        Self::decrease_token_liability(&env, &token, amount);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &config.payout_destination,
+            &amount,
+        );
+        (StorefrontBalanceSwept {
+            merchant,
+            storefront_id,
+            token,
+            amount,
+        })
+        .publish(&env);
+        Ok(remaining)
+    }
+
+    // ------------------------------------------------------------------------
+    // Issue #427 — time-of-use tariff schedules
+    // ------------------------------------------------------------------------
+
+    /// A schedule is valid iff its bands are non-empty, bounded, disjoint, and
+    /// collectively cover exactly [0, 1440) minutes of UTC time.
+    fn validate_tariff_bands(bands: &Vec<TariffBand>) -> Result<(), Error> {
+        let len = bands.len();
+        if len == 0 || len > MAX_TARIFF_BANDS {
+            return Err(Error::Tariff(TariffError::InvalidSchedule));
+        }
+        let mut covered: u32 = 0;
+        for i in 0..len {
+            let band = bands.get_unchecked(i);
+            if band.start_minute_utc >= band.end_minute_utc
+                || band.end_minute_utc > MINUTES_PER_DAY
+                || band.rate_per_unit < 0
+                || band.weekend_discount_bps > 10_000
+            {
+                return Err(Error::Tariff(TariffError::InvalidSchedule));
+            }
+            covered += (band.end_minute_utc - band.start_minute_utc) as u32;
+            for j in (i + 1)..len {
+                let other = bands.get_unchecked(j);
+                if band.start_minute_utc < other.end_minute_utc
+                    && other.start_minute_utc < band.end_minute_utc
+                {
+                    return Err(Error::Tariff(TariffError::InvalidSchedule));
+                }
+            }
+        }
+        if covered != MINUTES_PER_DAY as u32 {
+            return Err(Error::Tariff(TariffError::InvalidSchedule));
+        }
+        Ok(())
+    }
+
+    /// Creates an immutable tariff schedule. Updates are represented by new
+    /// schedule IDs, never by editing a schedule with reported usage.
+    pub fn create_tariff_schedule(
+        env: Env,
+        merchant: Address,
+        bands: Vec<TariffBand>,
+        effective_from: u64,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "create_tariff_schedule")?;
+        merchant.require_auth();
+        Self::validate_tariff_bands(&bands)?;
+
+        let counter_key = DataKey::Feature(FeatureKey::TariffScheduleCounter);
+        let schedule_id: u64 = env.storage().instance().get(&counter_key).unwrap_or(0) + 1;
+        let schedule = TariffSchedule {
+            schedule_id,
+            bands,
+            effective_from,
+            active: true,
+        };
+        storage::set_tariff_schedule(
+            &env,
+            &DataKey::Feature(FeatureKey::TariffSchedule(schedule_id)),
+            &schedule,
+        );
+        env.storage().instance().set(&counter_key, &schedule_id);
+        (TariffScheduleCreated {
+            schedule_id,
+            merchant,
+        })
+        .publish(&env);
+        Ok(schedule_id)
+    }
+
+    pub fn get_tariff_schedule(env: Env, schedule_id: u64) -> Option<TariffSchedule> {
+        storage::get_tariff_schedule(
+            &env,
+            &DataKey::Feature(FeatureKey::TariffSchedule(schedule_id)),
+        )
+    }
+
+    pub fn get_subscription_tariff(env: Env, subscription_id: u64) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::SubscriptionTariff(
+                subscription_id,
+            )))
+    }
+
+    /// Attaches a schedule to a metered subscription. Only allowed before any
+    /// usage is reported in the current cycle, so tariffs never reprice the past.
+    pub fn attach_tariff_to_subscription(
+        env: Env,
+        merchant: Address,
+        subscription_id: u64,
+        schedule_id: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        let mut sub: MeteredSubscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Metered(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::MeteredNotFound))?;
+        if sub.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        let schedule = storage::get_tariff_schedule(
+            &env,
+            &DataKey::Feature(FeatureKey::TariffSchedule(schedule_id)),
+        )
+        .ok_or(Error::Tariff(TariffError::ScheduleNotFound))?;
+        if !schedule.active || sub.accumulated_units > 0 {
+            return Err(Error::Tariff(TariffError::NotAttachable));
+        }
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::SubscriptionTariff(subscription_id)),
+            &schedule_id,
+        );
+        sub.accumulated_cost = 0;
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Metered(subscription_id)),
+            &sub,
+        );
+        (TariffAttached {
+            subscription_id,
+            schedule_id,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Prices `units` consumed at `consumed_at` (UTC unix seconds) against the
+    /// matching ToU band, using U256 intermediates for the discount math.
+    fn tou_cost(
+        env: &Env,
+        band: &TariffBand,
+        units: u64,
+        consumed_at: u64,
+    ) -> Result<i128, Error> {
+        let day_of_week = (consumed_at / SECONDS_PER_DAY + 4) % 7; // 0 = Sunday
+        let is_weekend = day_of_week == 0 || day_of_week == 6;
+        let bps = if is_weekend {
+            10_000u32 - band.weekend_discount_bps
+        } else {
+            10_000u32
+        };
+        let product = U256::from_u128(env, units as u128)
+            .mul(&U256::from_u128(env, band.rate_per_unit as u128))
+            .mul(&U256::from_u32(env, bps));
+        let scaled = product
+            .div(&U256::from_u32(env, 10_000))
+            .to_u128()
+            .ok_or(Error::Payment(PaymentError::BillingOverflow))?;
+        i128::try_from(scaled).map_err(|_| Error::Payment(PaymentError::BillingOverflow))
+    }
+
+    /// Reports kWh deltas with the meter timestamp window used for band lookup.
+    /// Hard billing caps are enforced at report time and again at billing time.
+    pub fn report_tou_usage(
+        env: Env,
+        merchant: Address,
+        subscription_id: u64,
+        units: u64,
+        consumed_at: u64,
+    ) -> Result<i128, Error> {
+        merchant.require_auth();
+        if units == 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        let mut sub: MeteredSubscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Metered(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::MeteredNotFound))?;
+        if sub.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let schedule_id = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::Feature(FeatureKey::SubscriptionTariff(
+                subscription_id,
+            )))
+            .ok_or(Error::Tariff(TariffError::ScheduleNotFound))?;
+        let schedule = storage::get_tariff_schedule(
+            &env,
+            &DataKey::Feature(FeatureKey::TariffSchedule(schedule_id)),
+        )
+        .ok_or(Error::Tariff(TariffError::ScheduleNotFound))?;
+        if !schedule.active || schedule.effective_from > env.ledger().timestamp() {
+            return Err(Error::Payment(PaymentError::NotYetDue));
+        }
+
+        if let Some(max_units) = sub.max_units_per_period {
+            if sub.accumulated_units.saturating_add(units) > max_units {
+                return Err(Error::Subscription(SubscriptionError::UsageCapExceeded));
+            }
+        }
+
+        // Validation guarantees exactly one band covers every minute of the day.
+        let minute = ((consumed_at % SECONDS_PER_DAY) / 60) as u32;
+        let mut band: Option<TariffBand> = None;
+        for i in 0..schedule.bands.len() {
+            let candidate = schedule.bands.get_unchecked(i);
+            if minute >= candidate.start_minute_utc && minute < candidate.end_minute_utc {
+                band = Some(candidate);
+                break;
+            }
+        }
+        let band = band.ok_or(Error::Tariff(TariffError::InvalidSchedule))?;
+        let cost = Self::tou_cost(&env, &band, units, consumed_at)?;
+        let new_cost = sub
+            .accumulated_cost
+            .checked_add(cost)
+            .ok_or(Error::Payment(PaymentError::BillingOverflow))?;
+        if let Some(cap) = sub.billing_cap {
+            if new_cost > cap {
+                return Err(Error::Subscription(SubscriptionError::BillingCapExceeded));
+            }
+        }
+
+        sub.accumulated_units = sub.accumulated_units.saturating_add(units);
+        sub.accumulated_cost = new_cost;
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Metered(subscription_id)),
+            &sub,
+        );
+        (UsageReported {
+            subscription_id,
+            units,
+            accumulated: sub.accumulated_units,
+        })
+        .publish(&env);
+        (TouUsageReported {
+            subscription_id,
+            units,
+            cost,
+            band_start_minute_utc: band.start_minute_utc,
+        })
+        .publish(&env);
+        Ok(cost)
     }
 
     fn validate_bps(bps: u32) -> Result<(), Error> {
@@ -16677,6 +17311,9 @@ mod test_cross_contract_escrow_verification;
 
 #[cfg(test)]
 mod test_metered_billing;
+
+#[cfg(test)]
+mod test_storefront;
 
 #[cfg(test)]
 mod test_installment_refund;
